@@ -2,7 +2,9 @@ from datetime import timedelta
 from collections.abc import Callable
 import traceback
 
-from pandas import DataFrame, Timestamp
+import pandas as pd
+from loguru import logger
+from tqdm import tqdm
 from tqsdk import TqApi, TqAuth
 
 from vnpy.trader.datafeed import BaseDatafeed
@@ -48,7 +50,7 @@ class TqsdkDatafeed(BaseDatafeed):
 
         tq_symbol: str = f"{req.exchange.value}.{req.symbol}"
 
-        df: DataFrame = api.get_kline_data_series(
+        df: pd.DataFrame = api.get_kline_data_series(
             symbol=tq_symbol,
             duration_seconds=interval,
             start_dt=req.start,
@@ -64,9 +66,9 @@ class TqsdkDatafeed(BaseDatafeed):
         if df is not None:
             for tp in df.itertuples():
                 # 天勤时间为与1970年北京时间相差的秒数，需要加上8小时差
-                dt: Timestamp = Timestamp(tp.datetime).to_pydatetime() + timedelta(
-                    hours=8
-                )
+                dt: pd.Timestamp = pd.Timestamp(
+                    tp.datetime
+                ).to_pydatetime() + timedelta(hours=8)
 
                 bar: BarData = BarData(
                     symbol=req.symbol,
@@ -84,3 +86,28 @@ class TqsdkDatafeed(BaseDatafeed):
                 bars.append(bar)
 
         return bars
+
+    def query_all(
+        self, ind_class: str, interval: Interval, data_length: int = 1e4
+    ) -> pd.DataFrame | None:
+        """查询k线数据"""
+        # 初始化API
+        duration_seconds: str = INTERVAL_VT2TQ.get(interval, None)
+        r_df_list = []
+        with TqApi(auth=TqAuth(self.username, self.password)) as api:
+            symbols = api.query_quotes(ins_class=ind_class)
+            for symbol in tqdm(symbols):
+                r = api.get_kline_serial(
+                    symbol=symbol,
+                    duration_seconds=duration_seconds,
+                    data_length=data_length,
+                ).dropna()
+                logger.info(f"[{ind_class}] {symbol} {r.shape} / {data_length}")
+                r_df_list.append(r)
+
+        if r_df_list:
+            df = pd.concat(r_df_list).drop(['id', 'duration'], axis=1)
+        else:
+            df = None
+
+        return df
