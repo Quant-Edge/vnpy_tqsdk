@@ -1,3 +1,4 @@
+import concurrent.futures
 import datetime as dt
 from collections.abc import Callable
 from pathlib import Path
@@ -94,7 +95,7 @@ class TqsdkDatafeed(BaseDatafeed):
 
     def query_free_all(
         self, ind_class: str, interval: Interval, data_length: int = 1e4
-    ) -> pd.DataFrame | None:
+    ) -> pl.DataFrame | None:
         """查询k线数据"""
         # 初始化API
         duration_seconds: str = INTERVAL_VT2TQ.get(interval, None)
@@ -112,6 +113,7 @@ class TqsdkDatafeed(BaseDatafeed):
 
         if r_df_list:
             df = pd.concat(r_df_list).drop(self.drop_cols, axis=1)
+            df = self.format_df(df)
         else:
             df = None
 
@@ -126,28 +128,40 @@ class TqsdkDatafeed(BaseDatafeed):
     ) -> pl.DataFrame:
         early_df_list = []
         iter_df = cur_df.group_by("jj_code").agg(pl.col("open_time").min())
-        with TqApi(auth=TqAuth(self.username, self.password)) as api:
-            for row in tqdm(
-                iter_df.iter_rows(named=True), desc=f"Total {len(iter_df)}"
-            ):
-                jj_code = row["jj_code"]
-                end = row["open_time"] - self.get_time_step(interval)
-                duration_seconds: str = INTERVAL_VT2TQ.get(interval, None)
-                df = api.get_kline_data_series(
-                    symbol=jj_code,
-                    duration_seconds=duration_seconds,
-                    start_dt=start_datetime,
-                    end_dt=end,
-                    adj_type=adj_type,
-                ).dropna()
-                if df.empty:
-                    logger.warning(f"{jj_code} no early data.")
-                    continue
 
-                df = df.drop(self.drop_cols, axis=1)
-                early_df_list.append(self.format_df(df))
+        def fetch_data(row):
+            jj_code = row["jj_code"]
+            end = row["open_time"] - self.get_time_step(interval)
+            duration_seconds = INTERVAL_VT2TQ.get(interval, None)
+            # 每个线程单独创建 TqApi 实例
+            with TqApi(auth=TqAuth(self.username, self.password)) as api:
+                try:
+                    df = api.get_kline_data_series(
+                        symbol=jj_code,
+                        duration_seconds=duration_seconds,
+                        start_dt=start_datetime,
+                        end_dt=end,
+                        adj_type=adj_type,
+                    )
+                    before_drop_shape = df.shape
+                    df = df.dropna()
+                    logger.info(f"{jj_code} {before_drop_shape} -> {df.shape}")
+                except Exception as e:
+                    logger.error(f"{jj_code} {e}")
+                    return None
 
-        return pl.concat(early_df_list)
+            if df.empty:
+                logger.warning(f"{jj_code} no early data.")
+                return None
+            df = df.drop(self.drop_cols, axis=1)
+            return self.format_df(df)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(tqdm(executor.map(fetch_data, iter_df.iter_rows(named=True)), total=len(iter_df), desc=f"Total {len(iter_df)}"))
+
+        early_df_list = [result for result in results if result is not None]
+
+        return pl.concat(early_df_list) if early_df_list else pl.DataFrame()
 
     def query_pro_data(
         self,
