@@ -1,8 +1,10 @@
-from datetime import timedelta
+import datetime as dt
 from collections.abc import Callable
+from pathlib import Path
 import traceback
 
 import pandas as pd
+import polars as pl
 from loguru import logger
 from tqdm import tqdm
 from tqsdk import TqApi, TqAuth
@@ -12,6 +14,7 @@ from vnpy.trader.setting import SETTINGS
 from vnpy.trader.constant import Interval
 from vnpy.trader.object import BarData, HistoryRequest
 from vnpy.trader.utility import ZoneInfo
+from vnpy.trader.database import DB_TZ
 
 
 INTERVAL_VT2TQ: dict[Interval, int] = {
@@ -30,6 +33,8 @@ class TqsdkDatafeed(BaseDatafeed):
         """"""
         self.username: str = SETTINGS["datafeed.username"]
         self.password: str = SETTINGS["datafeed.password"]
+
+        self.drop_cols = ["id", "duration"]
 
     def query_bar_history(
         self, req: HistoryRequest, output: Callable = print
@@ -54,7 +59,7 @@ class TqsdkDatafeed(BaseDatafeed):
             symbol=tq_symbol,
             duration_seconds=interval,
             start_dt=req.start,
-            end_dt=(req.end + timedelta(1)),
+            end_dt=(req.end + dt.timedelta(1)),
         )
 
         # 关闭API
@@ -66,15 +71,15 @@ class TqsdkDatafeed(BaseDatafeed):
         if df is not None:
             for tp in df.itertuples():
                 # 天勤时间为与1970年北京时间相差的秒数，需要加上8小时差
-                dt: pd.Timestamp = pd.Timestamp(
+                datetime: pd.Timestamp = pd.Timestamp(
                     tp.datetime
-                ).to_pydatetime() + timedelta(hours=8)
+                ).to_pydatetime() + dt.timedelta(hours=8)
 
                 bar: BarData = BarData(
                     symbol=req.symbol,
                     exchange=req.exchange,
                     interval=req.interval,
-                    datetime=dt.replace(tzinfo=CHINA_TZ),
+                    datetime=datetime.replace(tzinfo=CHINA_TZ),
                     open_price=tp.open,
                     high_price=tp.high,
                     low_price=tp.low,
@@ -87,7 +92,7 @@ class TqsdkDatafeed(BaseDatafeed):
 
         return bars
 
-    def query_all(
+    def query_free_all(
         self, ind_class: str, interval: Interval, data_length: int = 1e4
     ) -> pd.DataFrame | None:
         """查询k线数据"""
@@ -106,8 +111,97 @@ class TqsdkDatafeed(BaseDatafeed):
                 r_df_list.append(r)
 
         if r_df_list:
-            df = pd.concat(r_df_list).drop(['id', 'duration'], axis=1)
+            df = pd.concat(r_df_list).drop(self.drop_cols, axis=1)
         else:
             df = None
 
         return df
+
+    def get_early_pro_data(
+        self,
+        cur_df: pl.DataFrame,
+        interval: Interval,
+        start_datetime: dt.datetime = dt.datetime(2010, 1, 1),
+        adj_type: str | None = None,
+    ) -> pl.DataFrame:
+        early_df_list = []
+        iter_df = cur_df.group_by("jj_code").agg(pl.col("open_time").min())
+        with TqApi(auth=TqAuth(self.username, self.password)) as api:
+            for row in tqdm(
+                iter_df.iter_rows(named=True), desc=f"Total {len(iter_df)}"
+            ):
+                jj_code = row["jj_code"]
+                end = row["open_time"] - self.get_time_step(interval)
+                duration_seconds: str = INTERVAL_VT2TQ.get(interval, None)
+                df = api.get_kline_data_series(
+                    symbol=jj_code,
+                    duration_seconds=duration_seconds,
+                    start_dt=start_datetime,
+                    end_dt=end,
+                    adj_type=adj_type,
+                ).dropna()
+                if df.empty:
+                    logger.warning(f"{jj_code} no early data.")
+                    continue
+
+                df = df.drop(self.drop_cols, axis=1)
+                early_df_list.append(self.format_df(df))
+
+        return pl.concat(early_df_list)
+
+    def query_pro_data(
+        self,
+        symbol: str,
+        interval: Interval,
+        start: dt.datetime,
+        end: dt.datetime,
+        adj_type: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        查询pro数据
+        """
+        duration_seconds: str = INTERVAL_VT2TQ.get(interval, None)
+        with TqApi(auth=TqAuth(self.username, self.password)) as api:
+            df = api.get_kline_data_series(
+                symbol=symbol,
+                duration_seconds=duration_seconds,
+                start_dt=start,
+                end_dt=end,
+                adj_type=adj_type,
+            ).dropna()
+            if not df.empty:
+                df = df.drop(self.drop_cols, axis=1)
+
+        return df
+
+    @staticmethod
+    def format_df(df: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
+        if isinstance(df, pd.DataFrame):
+            df = pl.from_pandas(df)
+        return (
+            df.with_columns(
+                pl.col("datetime").cast(pl.Datetime(time_unit="ns", time_zone=DB_TZ))
+            )
+            .rename({"datetime": "open_time", "symbol": "jj_code"})
+            .with_columns(
+                close_time=pl.col("open_time")
+                + pl.duration(minutes=59, seconds=59, milliseconds=999)
+            )
+        )
+
+    @staticmethod
+    def get_time_step(interval: Interval) -> dt.timedelta:
+        return {
+            Interval.MINUTE: dt.timedelta(minutes=1),
+            Interval.HOUR: dt.timedelta(hours=1),
+            Interval.DAILY: dt.timedelta(days=1),
+        }[interval]
+
+    @staticmethod
+    def save_df(df: pd.DataFrame | pl.DataFrame, file_path: Path):
+        if isinstance(df, pd.DataFrame):
+            df.to_parquet(file_path, index=False)
+        elif isinstance(df, pl.DataFrame):
+            df.write_parquet(file_path)
+        else:
+            raise TypeError(f"Unsupported type: {type(df)}")
